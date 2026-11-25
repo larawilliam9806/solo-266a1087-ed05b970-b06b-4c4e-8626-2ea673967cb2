@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HLL 跨馆去重读者数报送</title>
+  <style>
+    body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+           margin: 2rem auto; max-width: 56rem; padding: 0 1rem; color: #1f2933; }
+    h1 { font-size: 1.4rem; }
+    section { border: 1px solid #cbd2d9; border-radius: 8px; padding: 1rem 1.25rem;
+              margin: 1rem 0; background: #f8fafc; }
+    h2 { font-size: 1.05rem; margin-top: 0; }
+    label { display: block; margin: 0.5rem 0 0.2rem; font-size: 0.9rem; }
+    input[type=text], input[type=file] { width: 100%; box-sizing: border-box;
+            padding: 0.45rem; border: 1px solid #9aa5b1; border-radius: 6px; }
+    button { margin-top: 0.8rem; padding: 0.5rem 1.1rem; border: 0; border-radius: 6px;
+             background: #2563eb; color: #fff; cursor: pointer; }
+    button.secondary { background: #b45309; }
+    button.tertiary { background: #475569; }
+    .ok { background: #dcfce7; border: 1px solid #16a34a; padding: 0.7rem 1rem;
+          border-radius: 6px; }
+    .err { background: #fee2e2; border: 1px solid #dc2626; padding: 0.7rem 1rem;
+           border-radius: 6px; }
+    code { background: #e4e7eb; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    .hint { font-size: 0.85rem; color: #52606d; }
+  </style>
+</head>
+<body>
+  <h1>电子资源月度去重读者数 · HLL 摘要报送</h1>
+
+  {% if error %}<div class="err">操作失败：{{ error }}</div>{% endif %}
+  {% if message %}<div class="ok">{{ message }}</div>{% endif %}
+
+  <section>
+    <h2>1. 报送 / 换报</h2>
+    <p class="hint">按月份、资源号、馆号上传 JSON。同一馆再次上传即为换报，整行覆盖旧摘要。
+      JSON 需含 <code>month</code>、<code>resource</code>、<code>branch</code>、
+      <code>registers</code>（128 个 0～58 的整数）。</p>
+    <form action="{{ url_for('submit_report') }}" method="post" enctype="multipart/form-data">
+      <label>月份（YYYY-MM）<input type="text" name="month" required placeholder="2026-11"></label>
+      <label>资源号<input type="text" name="resource" required placeholder="ER-0001"></label>
+      <label>馆号<input type="text" name="branch" required placeholder="LIB-A"></label>
+      <label>JSON 文件<input type="file" name="file" accept="application/json,.json" required></label>
+      <button type="submit">上传报送</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>2. 撤回报送</h2>
+    <p class="hint">撤回只删除本馆摘要并增量重算合并结果，不遍历其他馆的摘要。</p>
+    <form action="{{ url_for('withdraw_report') }}" method="post">
+      <label>月份（YYYY-MM）<input type="text" name="month" required placeholder="2026-11"></label>
+      <label>资源号<input type="text" name="resource" required placeholder="ER-0001"></label>
+      <label>馆号<input type="text" name="branch" required placeholder="LIB-A"></label>
+      <button class="secondary" type="submit">撤回</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>3. 下载已保存的合并摘要</h2>
+    <p class="hint">按月份和资源号下载逐位置取最大值后的合并 JSON（无报送记录时返回 404）。</p>
+    <form id="dl-form" onsubmit="event.preventDefault();
+        var m=this.month.value.trim(), r=this.resource.value.trim();
+        window.location='{{ url_for('download_merged', month='__M__', resource='__R__') }}'
+          .replace('__M__', encodeURIComponent(m)).replace('__R__', encodeURIComponent(r));">
+      <label>月份（YYYY-MM）<input type="text" name="month" required placeholder="2026-11"></label>
+      <label>资源号<input type="text" name="resource" required placeholder="ER-0001"></label>
+      <button class="tertiary" type="submit">下载合并摘要</button>
+    </form>
+  </section>
+</body>
+</html>
