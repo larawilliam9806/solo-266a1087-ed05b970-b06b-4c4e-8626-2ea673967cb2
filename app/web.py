@@ -108,6 +108,63 @@ def create_app(db_path: str | None = None) -> Flask:
     def health() -> Response:
         return jsonify({"status": "ok"})
 
+    # -- 旧计数整理 -------------------------------------------------------
+
+    @app.get("/maintenance/status")
+    def maintenance_status() -> Response:
+        return jsonify(
+            {"counts_format": get_db().counts_format()}
+        )
+
+    @app.post("/maintenance/compact")
+    def compact_counts() -> Response:
+        """按月份/资源整理旧计数；两者留空表示整理全库。"""
+        if request.is_json:
+            payload: Any = request.get_json(silent=False)
+            if not isinstance(payload, dict):
+                raise ValidationError("JSON 请求体必须是对象")
+            data: dict[str, Any] = payload
+        else:
+            data = request.form.to_dict(flat=True) or request.args.to_dict(flat=True)
+        month = data.get("month") or None
+        resource = data.get("resource") or None
+        batch_size = data.get("batch_size")
+        if batch_size is not None:
+            try:
+                batch_size = int(batch_size)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("batch_size 必须是正整数") from exc
+        try:
+            if batch_size is None:
+                result = get_db().compact_counts(month, resource)
+            else:
+                result = get_db().compact_counts(month, resource, batch_size)
+        except (ValueError, RuntimeError) as exc:
+            # 整理失败会整批回滚；已提交的计数与生效格式保持不变。
+            raise ValidationError(f"整理失败，已保留届时已提交的数据：{exc}") from exc
+        result_dict = result.as_dict()
+        result_dict["counts_format"] = get_db().counts_format()
+        if _wants_html():
+            if result.completed and result.legacy_remaining == 0:
+                message = (
+                    f"整理完成：计数 {result.counts_converted} 组、"
+                    f"合并摘要 {result.merged_converted} 组，库中只保留紧凑格式"
+                )
+            elif result.completed:
+                message = (
+                    f"指定范围已整理：计数 {result.counts_converted} 组、"
+                    f"合并摘要 {result.merged_converted} 组；"
+                    f"全库仍有 {result.legacy_remaining} 组旧计数，可留空范围继续整理"
+                )
+            else:
+                message = (
+                    f"整理暂未完成：本次计数 {result.counts_converted} 组、"
+                    f"合并摘要 {result.merged_converted} 组，"
+                    f"仍有 {result.legacy_remaining} 组旧计数，可再次整理"
+                )
+            return redirect(url_for("index", status=0, message=message))
+        return jsonify(result_dict)
+
     # -- 报送 / 换报 -----------------------------------------------------
 
     @app.post("/reports")

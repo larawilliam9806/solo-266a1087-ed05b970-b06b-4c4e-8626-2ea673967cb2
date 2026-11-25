@@ -8,12 +8,14 @@
 
 ```
 app/
-  hll.py       # 统一哈希口径（SHA-256 → 128 寄存器，rank 1～58）与入参校验
-  db.py        # SQLite 存档、增量合并、换报/撤回的事务处理
-  web.py       # Flask 路由与报送页
-  templates/   # 报送/撤回/下载页面
-tests/         # pytest 用例（含并发与写入失败回滚）
-examples/      # 仅标准库的报送示例客户端
+  hll.py         # 统一哈希口径（SHA-256 → 128 寄存器，rank 1～58）与入参校验
+  compact.py     # 寄存器计数直方图与合并摘要的紧凑二进制编码
+  db.py          # SQLite 存档、增量合并、换报/撤回、旧计数整理
+  maintenance.py # 命令行整理入口（python -m app.maintenance）
+  web.py         # Flask 路由与报送页
+  templates/     # 报送/撤回/整理/下载页面
+tests/           # pytest 用例（含并发、写入失败回滚、旧库整理）
+examples/        # 仅标准库的报送示例客户端
 Dockerfile / docker-compose.yml / wsgi.py
 ```
 
@@ -56,6 +58,8 @@ gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 4 wsgi:app
 | `POST`/`DELETE` | `/reports/withdraw` | 撤回本馆报送 |
 | `GET` | `/reports/<month>/<resource>/<branch>` | 查本馆现行报送 |
 | `GET` | `/merged/<month>/<resource>/download` | 下载已保存的合并摘要 JSON |
+| `GET` | `/maintenance/status` | 查看计数存储格式（`compact` / `legacy`） |
+| `POST` | `/maintenance/compact` | 整理旧计数，可按 `month`、`resource` 限定范围 |
 | `GET` | `/health` | 健康检查 |
 
 报送 JSON 格式：
@@ -85,9 +89,14 @@ curl -X DELETE "localhost:8000/reports/withdraw?month=2026-11&resource=ER-0001&b
 
 # 下载合并摘要
 curl -OJ localhost:8000/merged/2026-11/ER-0001/download
+
+# 查看计数格式 / 整理旧计数（可选范围；失败可原样重试）
+curl localhost:8000/maintenance/status
+curl -X POST localhost:8000/maintenance/compact \
+  -H 'Content-Type: application/json' -d '{"month":"2026-11","resource":"ER-0001"}'
 ```
 
-浏览器访问 `/` 可用表单完成报送、撤回、下载；程序化调用（带
+浏览器访问 `/` 可用表单完成报送、撤回、整理、下载；程序化调用（带
 `Accept: application/json`）出错时返回 JSON 错误体（400/404）。
 
 ## 合并算法与关键约束的实现
@@ -95,33 +104,63 @@ curl -OJ localhost:8000/merged/2026-11/ER-0001/download
 ### 1. 逐位置取最大值，换报/撤回不遍历其他馆摘要
 
 除馆报表 `branch_reports` 和合并表 `merged_summaries` 外，另维护
-`register_counts(month, resource, position, value, cnt)`：按每个寄存器
-位置保存完整的**取值直方图**（该取值当前有多少个馆贡献）。
+`register_counts`：每个 `(月份, 资源号)` 一行，保存该键 128 个位置的
+完整**取值直方图**（每个取值当前有多少个馆贡献），编码为一个紧凑 BLOB。
 
 - 报送/换报：只读取**本馆**旧寄存器，计算每个位置的差分（旧值 `-1`、
-  新值 `+1`），按主键 upsert/delete 直方图行；
-- 撤回：只对本馆旧值做 `-1` 差分；计数归零则删除该直方图行；
-- 合并摘要：一条 `GROUP BY position` + `MAX(value)` 聚合得到逐位置
-  最大值（无计数的位置即 0），全程不扫描其他馆的 `branch_reports` 行；
+  新值 `+1`），读出本键直方图、施加差分后写回；
+- 撤回：只对本馆旧值做 `-1` 差分，计数归零则移除该取值；
+- 合并摘要：逐位置取直方图中的最大取值（无计数的位置即 0），全程不
+  扫描其他馆的 `branch_reports` 行；
 - 最大值馆撤回或换报降值时，次大值可直接从直方图恢复，不会丢失；
-  同值多馆用 `cnt` 记录，撤回其中一个馆不会错误降低最大值；
-- 直方图规模只与寄存器数（128）和取值域（1～58）有关，不随馆数膨胀。
+  同值多馆用计数记录，撤回其中一个馆不会错误降低最大值；
+- 直方图规模只与寄存器数（128）和取值域（1～58）有关，不随馆数膨胀；
+- 即使合并值没变（最大值仍由别馆保持），本馆换报的计数变动也照常
+  写入直方图，保证后续撤回/降值的合并结果正确。
 
-### 2. 馆报与汇总一并生效，写入失败沿用原数据
+### 2. 紧凑格式：计数与索引占页减半
+
+旧格式每个 `(位置, 取值)` 一行、主键四列；新格式每个 `(月份, 资源号)`
+一行，主键只有两列，直方图编码为 BLOB（详见 `app/compact.py`）：
+
+- 16 字节位图标记哪些位置有非零取值，再按位置写「取值个数 + 取值/馆数」；
+- 全零直方图仅 17 字节，全零合并摘要仅 97 字节（128 × 6 bit 定长打包）；
+- 新建库与新建汇总直接使用紧凑格式。
+
+以 100 组月份/资源、每组 8 个馆在各位置分别报出不同非零值的同一负载
+实测：`register_counts` 由 346 页降至 116 页，两个计数/索引表合计同样
+不超过旧格式一半（测试 `test_compact_counts_and_indexes_fit_in_half_the_pages`）。
+
+### 3. 旧库整理按月份和资源分批进行，期间照常报送
+
+- 启动时若检测到旧版 `register_counts`，改名为 `register_counts_legacy`
+  保留数据，新表即刻可用；此时 `/maintenance/status` 报告 `legacy`；
+- `POST /maintenance/compact`（或 `python -m app.maintenance compact`）
+  按 `(月份, 资源号)` 分批把旧行合并为一行紧凑 BLOB，每批单独提交；
+- 整理期间同键的换报/撤回仍可入账：写入路径会把该键即时转为紧凑格式
+  并纳入本批已提交的计数变动，后续整理不会用旧行覆盖它；
+- 旧合并摘要是 JSON 文本时同样改写为紧凑编码，即使合并值没变也落盘；
+- 旧行全部迁走后删除旧表，成功后库中只保留新格式（`status` 报 `compact`）。
+
+### 4. 馆报与汇总一并生效，写入失败沿用原数据
 
 每次报送/换报/撤回都在**单个 `BEGIN IMMEDIATE` 事务**内完成三件事：
 写馆报、更新 `register_counts`、重写 `merged_summaries`。任何一步失败
 或 commit 失败即 `ROLLBACK`，库内保留原数据（测试
 `test_commit_failure_keeps_original_data` 模拟 commit 失败验证）。
 
-### 3. 不同馆并发更改，每笔成功操作都计入汇总
+整理同样逐批使用 `BEGIN IMMEDIATE`：失败的一批整体回滚，届时已提交的
+计数与生效格式保持不变；再次调用整理会从剩余旧行继续（测试
+`test_compaction_failure_keeps_committed_state_and_can_retry`）。
+
+### 5. 不同馆并发更改，每笔成功操作都计入汇总
 
 - WAL 模式 + `busy_timeout=30s` + 应用层指数退避重试，写事务经
   `BEGIN IMMEDIATE` 在 SQLite 层串行化，杜绝写写冲突导致的丢更新；
 - 每个事务只做本馆差分，事务结束后的合并摘要始终等于全部已提交馆报的
   逐位置最大值（并发用例见 `test_concurrent_*`）。
 
-### 4. 无报送与全撤回
+### 6. 无报送与全撤回
 
 - 从未报送过的 `(月份, 资源号)`：下载返回 404；
 - 报送后又全部撤回：合并摘要仍已保存，寄存器为 128 个 0。

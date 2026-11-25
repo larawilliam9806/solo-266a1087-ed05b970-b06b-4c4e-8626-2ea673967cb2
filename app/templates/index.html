@@ -58,7 +58,18 @@
   </section>
 
   <section>
-    <h2>3. 下载已保存的合并摘要</h2>
+    <h2>4. 整理旧计数（可选）</h2>
+    <p class="hint">把旧版逐行计数按月份、资源号合并为紧凑格式。可留空表示整理全库；
+      整理期间报送、换报、撤回仍可正常进行。失败时保留已提交的计数与生效格式，可重新整理。</p>
+    <form action="{{ url_for('compact_counts') }}" method="post">
+      <label>月份（YYYY-MM，可留空）<input type="text" name="month" placeholder="2026-11"></label>
+      <label>资源号（可留空）<input type="text" name="resource" placeholder="ER-0001"></label>
+      <button class="tertiary" type="submit">整理旧计数</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>5. 下载已保存的合并摘要</h2>
     <p class="hint">按月份和资源号下载逐位置取最大值后的合并 JSON（无报送记录时返回 404）。</p>
     <form id="dl-form" onsubmit="event.preventDefault();
         var m=this.month.value.trim(), r=this.resource.value.trim();
